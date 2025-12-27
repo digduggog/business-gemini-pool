@@ -1132,6 +1132,184 @@ def download_file_with_jwt(jwt: str, session_name: str, file_id: str, proxy: Opt
     return content
 
 
+def stream_chat_generator(jwt: str, sess_name: str, message: str, 
+                          proxy: str, team_id: str, file_ids: List[str] = None):
+    """真正的流式聊天生成器，边接收边 yield 文本片段
+    
+    Gemini 的流式响应格式：
+    - 动态增长的 JSON 数组
+    - 开始：发送 `[`
+    - 中间：每个块是 JSON 对象，块之间用 `\n,` 分隔
+    - 结束：以 `]]` 结束
+    
+    Yields:
+        dict: {"type": "text", "content": str} 或 {"type": "done", "session": str, "file_ids": list}
+    """
+    query_parts = [{"text": message}]
+    request_file_ids = file_ids if file_ids else []
+    
+    body = {
+        "configId": team_id,
+        "additionalParams": {"token": "-"},
+        "streamAssistRequest": {
+            "session": sess_name,
+            "query": {"parts": query_parts},
+            "filter": "",
+            "fileIds": request_file_ids,
+            "answerGenerationMode": "NORMAL",
+            "assistGenerationConfig":{
+                "modelId":"gemini-3-pro-preview"
+            },
+            "toolsSpec": {
+                "webGroundingSpec": {},
+                "toolRegistry": "default_tool_registry",
+                "imageGenerationSpec": {},
+                "videoGenerationSpec": {}
+            },
+            "languageCode": "zh-CN",
+            "userMetadata": {"timeZone": "Etc/GMT-8"},
+            "assistSkippingMode": "REQUEST_ASSIST"
+        }
+    }
+
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        resp = requests.post(
+            STREAM_ASSIST_URL,
+            headers=get_headers(jwt),
+            json=body,
+            proxies=proxies,
+            verify=False,
+            timeout=120,
+            stream=True
+        )
+    except requests.RequestException as e:
+        raise AccountRequestError(f"聊天请求失败: {e}") from e
+
+    if resp.status_code != 200:
+        raise_for_account_response(resp, "聊天请求")
+
+    # 用于收集图片相关信息（流式结束后处理）
+    pending_file_ids = []
+    current_session = None
+    buffer = ""
+    
+    # 使用 iter_content 逐块读取，而不是 iter_lines
+    for chunk in resp.iter_content(chunk_size=1024, decode_unicode=True):
+        if not chunk:
+            continue
+        
+        # 如果 chunk 是 bytes，解码为字符串
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode('utf-8', errors='ignore')
+        
+        buffer += chunk
+        
+        # 循环查找分隔符 \n, （Gemini 的块分隔方式）
+        while "\n," in buffer:
+            part, buffer = buffer.split("\n,", 1)
+            part = part.strip()
+            
+            # 处理起始的 [ 符号
+            if part.startswith('['):
+                part = part[1:].strip()
+            
+            if not part:
+                continue
+            
+            # 尝试解析为 JSON
+            try:
+                data = json.loads(part)
+                sar = data.get("streamAssistResponse")
+                if not sar:
+                    continue
+                
+                # 获取session信息
+                session_info = sar.get("sessionInfo", {})
+                if session_info.get("session"):
+                    current_session = session_info["session"]
+                
+                answer = sar.get("answer") or {}
+                
+                for reply in answer.get("replies", []):
+                    gc = reply.get("groundedContent", {})
+                    content = gc.get("content", {})
+                    text = content.get("text", "")
+                    thought = content.get("thought", False)
+                    
+                    # 检查file字段（图片生成）
+                    file_info = content.get("file")
+                    if file_info and file_info.get("fileId"):
+                        pending_file_ids.append({
+                            "fileId": file_info["fileId"],
+                            "mimeType": file_info.get("mimeType", "image/png"),
+                            "fileName": file_info.get("name")
+                        })
+                    
+                    # yield 文本内容（非思考内容）
+                    if text and not thought:
+                        yield {"type": "text", "content": text}
+                        
+            except json.JSONDecodeError:
+                # JSON 解析失败，跳过这个块
+                continue
+            except Exception as e:
+                print(f"[流式] 解析块出错: {e}")
+                continue
+    
+    # 处理 buffer 中剩余的内容（最后一个块）
+    if buffer:
+        # 去掉结尾的 ]] 或 ]
+        buffer = buffer.strip()
+        if buffer.endswith(']]'):
+            buffer = buffer[:-2].strip()
+        elif buffer.endswith(']'):
+            buffer = buffer[:-1].strip()
+        
+        # 处理起始的 [ 符号
+        if buffer.startswith('['):
+            buffer = buffer[1:].strip()
+        
+        if buffer:
+            try:
+                data = json.loads(buffer)
+                sar = data.get("streamAssistResponse")
+                if sar:
+                    session_info = sar.get("sessionInfo", {})
+                    if session_info.get("session"):
+                        current_session = session_info["session"]
+                    
+                    answer = sar.get("answer") or {}
+                    
+                    for reply in answer.get("replies", []):
+                        gc = reply.get("groundedContent", {})
+                        content = gc.get("content", {})
+                        text = content.get("text", "")
+                        thought = content.get("thought", False)
+                        
+                        file_info = content.get("file")
+                        if file_info and file_info.get("fileId"):
+                            pending_file_ids.append({
+                                "fileId": file_info["fileId"],
+                                "mimeType": file_info.get("mimeType", "image/png"),
+                                "fileName": file_info.get("name")
+                            })
+                        
+                        if text and not thought:
+                            yield {"type": "text", "content": text}
+            except json.JSONDecodeError:
+                pass
+            except Exception as e:
+                print(f"[流式] 处理剩余buffer出错: {e}")
+    
+    # 发送完成信号，附带需要后续处理的图片信息
+    yield {
+        "type": "done", 
+        "session": current_session, 
+        "file_ids": pending_file_ids
+    }
+
+
 def upload_inline_image_to_gemini(jwt: str, session_name: str, team_id: str, 
                                    image_data: Dict, proxy: str = None) -> Optional[str]:
     """上传内联图片到 Gemini，返回 fileId"""
@@ -1781,6 +1959,236 @@ def chat_completions():
         # 检查是否指定了特定账号
         specified_account_id = data.get('account_id')
         
+        # 流式模式需要特殊处理：边收边发
+        if stream:
+            # 获取账号信息
+            account_idx = None
+            jwt = None
+            session = None
+            team_id = None
+            proxy = None
+            last_error = None
+            
+            if specified_account_id is not None:
+                # 使用指定的账号
+                accounts = account_manager.accounts
+                if specified_account_id < 0 or specified_account_id >= len(accounts):
+                    return jsonify({"error": f"无效的账号ID: {specified_account_id}"}), 400
+                account = accounts[specified_account_id]
+                if not account.get('enabled', True):
+                    return jsonify({"error": f"账号 {specified_account_id} 已禁用"}), 400
+                cooldown_until = account.get('cooldown_until', 0)
+                if cooldown_until > time.time():
+                    return jsonify({"error": f"账号 {specified_account_id} 正在冷却中，请稍后重试"}), 429
+                
+                account_idx = specified_account_id
+                try:
+                    jwt = ensure_jwt_for_account(account_idx, account)
+                    proxy = get_proxy()
+                    team_id = account.get("team_id")
+                    session = create_chat_session(jwt, team_id, proxy)
+                    
+                    for img in input_images:
+                        uploaded_file_id = upload_inline_image_to_gemini(jwt, session, team_id, img, proxy)
+                        if uploaded_file_id:
+                            gemini_file_ids.append(uploaded_file_id)
+                except (AccountRateLimitError, AccountAuthError, AccountRequestError) as e:
+                    last_error = e
+                    account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
+                except Exception as e:
+                    last_error = e
+            else:
+                # 轮训获取账号（按模型过滤）
+                available_accounts = account_manager.get_available_accounts(requested_model)
+                if not available_accounts:
+                    next_cd = account_manager.get_next_model_cooldown_info(requested_model)
+                    wait_msg = ""
+                    if next_cd:
+                        wait_msg = f"（模型 {requested_model} 最近冷却账号 {next_cd['index']}，约 {int(next_cd['cooldown_until']-time.time())} 秒后可重试）"
+                    return jsonify({"error": f"模型 {requested_model} 没有可用的账号{wait_msg}"}), 429
+
+                max_retries = len(available_accounts)
+                
+                for retry_idx in range(max_retries):
+                    try:
+                        account_idx, account = account_manager.get_next_account(requested_model)
+                        jwt = ensure_jwt_for_account(account_idx, account)
+                        proxy = get_proxy()
+                        team_id = account.get("team_id")
+                        session = create_chat_session(jwt, team_id, proxy)
+                        
+                        for img in input_images:
+                            uploaded_file_id = upload_inline_image_to_gemini(jwt, session, team_id, img, proxy)
+                            if uploaded_file_id:
+                                gemini_file_ids.append(uploaded_file_id)
+                        break  # 成功获取账号和session
+                    except AccountRateLimitError as e:
+                        last_error = e
+                        if account_idx is not None:
+                            pt_wait = seconds_until_next_pt_midnight()
+                            cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
+                            account_manager.mark_account_model_cooldown(account_idx, requested_model, str(e), cooldown_seconds)
+                        print(f"[聊天流式] 第{retry_idx+1}次尝试失败(限额): 模型={requested_model}, {e}")
+                        account_idx = None
+                        continue
+                    except AccountAuthError as e:
+                        last_error = e
+                        if account_idx is not None:
+                            account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
+                        print(f"[聊天流式] 第{retry_idx+1}次尝试失败(凭证): {e}")
+                        account_idx = None
+                        continue
+                    except AccountRequestError as e:
+                        last_error = e
+                        if account_idx is not None:
+                            account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
+                        print(f"[聊天流式] 第{retry_idx+1}次尝试失败(请求异常): {e}")
+                        account_idx = None
+                        continue
+                    except Exception as e:
+                        last_error = e
+                        print(f"[聊天流式] 第{retry_idx+1}次尝试失败: {type(e).__name__}: {e}")
+                        account_idx = None
+                        if retry_idx == 0 and account_idx is None:
+                            break
+                        continue
+            
+            if jwt is None or session is None:
+                error_message = last_error or "没有可用的账号"
+                status_code = 429 if isinstance(last_error, (AccountRateLimitError, NoAvailableAccount)) else 500
+                return jsonify({"error": f"所有账号请求失败: {error_message}"}), status_code
+
+            # 获取使用的账号csesidx
+            used_account_csesidx = None
+            if account_idx is not None and account_idx < len(account_manager.accounts):
+                used_account = account_manager.accounts[account_idx]
+                used_account_csesidx = used_account.get('csesidx', f'账号{account_idx}')
+
+            # 真正的流式响应生成器
+            def stream_generate():
+                chunk_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+                first_chunk = True
+                
+                try:
+                    for event in stream_chat_generator(jwt, session, user_message, proxy, team_id, gemini_file_ids):
+                        if event["type"] == "text":
+                            content = event["content"]
+                            chunk = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": "gemini-enterprise",
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": content} if not first_chunk else {"role": "assistant", "content": content},
+                                    "finish_reason": None
+                                }]
+                            }
+                            # 第一个 chunk 附带账号信息
+                            if first_chunk:
+                                chunk["account_csesidx"] = used_account_csesidx
+                                first_chunk = False
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        
+                        elif event["type"] == "done":
+                            # 处理图片（如果有的话，在流结束时发送图片URL）
+                            pending_file_ids = event.get("file_ids", [])
+                            current_session = event.get("session")
+                            
+                            if pending_file_ids and current_session:
+                                try:
+                                    file_metadata = get_session_file_metadata(jwt, current_session, team_id, proxy)
+                                    for finfo in pending_file_ids:
+                                        fid = finfo["fileId"]
+                                        mime = finfo["mimeType"]
+                                        fname = finfo.get("fileName")
+                                        meta = file_metadata.get(fid)
+                                        
+                                        if meta:
+                                            fname = fname or meta.get("name")
+                                            session_path = meta.get("session") or current_session
+                                        else:
+                                            session_path = current_session
+                                        
+                                        try:
+                                            image_data = download_file_with_jwt(jwt, session_path, fid, proxy)
+                                            
+                                            if is_base64_output_mode():
+                                                b64_data = base64.b64encode(image_data).decode("utf-8")
+                                                image_url = f"data:{mime};base64,{b64_data}"
+                                            else:
+                                                filename = save_image_to_cache(image_data, mime, fname)
+                                                image_url = f"{request.host_url}image/{filename}"
+                                            
+                                            # 发送图片URL作为一个chunk
+                                            img_chunk = {
+                                                "id": chunk_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": "gemini-enterprise",
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {"content": f"\n{image_url}"},
+                                                    "finish_reason": None
+                                                }]
+                                            }
+                                            yield f"data: {json.dumps(img_chunk, ensure_ascii=False)}\n\n"
+                                        except Exception as e:
+                                            print(f"[流式] 图片下载失败 (fileId={fid}): {e}")
+                                except Exception as e:
+                                    print(f"[流式] 获取文件元数据失败: {e}")
+                            
+                            # 发送结束标记
+                            end_chunk = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": "gemini-enterprise",
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": "stop"
+                                }]
+                            }
+                            yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                
+                except AccountRateLimitError as e:
+                    if account_idx is not None:
+                        pt_wait = seconds_until_next_pt_midnight()
+                        cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
+                        account_manager.mark_account_model_cooldown(account_idx, requested_model, str(e), cooldown_seconds)
+                    error_chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": "gemini-enterprise",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": f"\n\n[错误: 账号限额] {e}"},
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as e:
+                    error_chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": "gemini-enterprise",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": f"\n\n[错误] {e}"},
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+            
+            return Response(stream_generate(), mimetype='text/event-stream')
+        
+        # 非流式模式（保持原有逻辑）
         if specified_account_id is not None:
             # 使用指定的账号
             accounts = account_manager.accounts
@@ -1890,63 +2298,28 @@ def chat_completions():
         # 构建响应内容（包含图片）
         response_content = build_openai_response_content(chat_response, request.host_url)
 
-        if stream:
-            # 流式响应
-            def generate():
-                chunk_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-                chunk = {
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": "gemini-enterprise",
-                    "account_csesidx": used_account_csesidx,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": response_content},
-                        "finish_reason": None
-                    }]
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                
-                # 结束标记
-                end_chunk = {
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": "gemini-enterprise",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop"
-                    }]
-                }
-                yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return Response(generate(), mimetype='text/event-stream')
-        else:
-            # 非流式响应
-            response = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": "gemini-enterprise",
-                "account_csesidx": used_account_csesidx,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": response_content
-                    },
-                    "finish_reason": "stop"
-                }],
-                "usage": {
-                    "prompt_tokens": len(user_message),
-                    "completion_tokens": len(chat_response.text),
-                    "total_tokens": len(user_message) + len(chat_response.text)
-                }
+        # 非流式响应
+        response = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "gemini-enterprise",
+            "account_csesidx": used_account_csesidx,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": response_content
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": len(user_message),
+                "completion_tokens": len(chat_response.text),
+                "total_tokens": len(user_message) + len(chat_response.text)
             }
-            return jsonify(response)
+        }
+        return jsonify(response)
 
     except Exception as e:
         import traceback
